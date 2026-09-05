@@ -427,3 +427,20 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# facebook-content-extractor (Python)
+.env
+.env.*
+!.env.example
+
+downloads/
+
+*.db
+*.sqlite
+*.sqlite3
+
+.pytest_cache/
+.ruff_cache/
+
+.venv/
+venv/
