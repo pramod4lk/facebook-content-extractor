@@ -1,13 +1,7 @@
-import logging
-from collections.abc import Callable, Iterator
-
 import httpx
 
-logger = logging.getLogger(__name__)
-
-USER_AGENT = "facebook-extractor/0.2 (unofficial page scraper; see SPEC.md)"
+USER_AGENT = "facebook-extractor/0.3 (unofficial page scraper; see SPEC.md)"
 _LOGIN_WALL_MARKERS = ("log in to facebook", "log into facebook", "you must log in")
-_MAX_LISTING_PAGES = 20
 
 
 class ScrapeError(Exception):
@@ -25,6 +19,12 @@ def fetch_html(client: httpx.Client, url: str) -> str:
     if response.status_code != 200:
         raise ScrapeError(f"HTTP {response.status_code} fetching {url}")
 
+    if "/login" in response.url.path:
+        raise ScrapeError(
+            f"Facebook redirected {url} to a login page ({response.url}). This tool "
+            "does not log in or hold a session, so this page cannot be scraped this way."
+        )
+
     text = response.text
     if any(marker in text.lower() for marker in _LOGIN_WALL_MARKERS):
         raise ScrapeError(
@@ -32,23 +32,3 @@ def fetch_html(client: httpx.Client, url: str) -> str:
             "log in or hold a session, so this page cannot be scraped this way."
         )
     return text
-
-
-def iter_listing_pages(
-    client: httpx.Client,
-    first_url: str,
-    find_next_link: Callable[[str], str | None],
-    *,
-    max_pages: int = _MAX_LISTING_PAGES,
-) -> Iterator[str]:
-    """Yield each listing page's HTML, following `find_next_link(html) -> next_url`
-    pagination links until none is found or `max_pages` is reached (a hard safety cap,
-    not something Facebook enforces or documents)."""
-    url = first_url
-    for _ in range(max_pages):
-        page_html = fetch_html(client, url)
-        yield page_html
-        next_url = find_next_link(page_html)
-        if not next_url:
-            return
-        url = next_url

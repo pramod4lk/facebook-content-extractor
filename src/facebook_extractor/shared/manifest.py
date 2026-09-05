@@ -5,14 +5,13 @@ from pathlib import Path
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS downloads (
-    page_id TEXT NOT NULL,
     media_type TEXT NOT NULL,
     media_id TEXT NOT NULL,
     source_url TEXT NOT NULL,
     local_filename TEXT,
     download_status TEXT NOT NULL,
     downloaded_at TEXT,
-    PRIMARY KEY (page_id, media_type, media_id)
+    PRIMARY KEY (media_type, media_id)
 );
 """
 
@@ -25,8 +24,9 @@ class DownloadStatus(StrEnum):
 
 
 class Manifest:
-    """SQLite-backed download manifest (SPEC.md FR-013). One row per (page, media_type,
-    media_id); used for duplicate detection and resuming interrupted runs (FR-014)."""
+    """SQLite-backed download manifest (SPEC.md FR-013). One row per (media_type,
+    media_id); used for duplicate detection and resuming across runs (FR-014). No
+    page scoping — a run processes an arbitrary batch of URLs, not one Page."""
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,18 +43,16 @@ class Manifest:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def get_status(self, *, page_id: str, media_type: str, media_id: str) -> DownloadStatus | None:
+    def get_status(self, *, media_type: str, media_id: str) -> DownloadStatus | None:
         row = self._connection.execute(
-            "SELECT download_status FROM downloads "
-            "WHERE page_id = ? AND media_type = ? AND media_id = ?",
-            (page_id, media_type, media_id),
+            "SELECT download_status FROM downloads WHERE media_type = ? AND media_id = ?",
+            (media_type, media_id),
         ).fetchone()
         return DownloadStatus(row[0]) if row else None
 
     def record(
         self,
         *,
-        page_id: str,
         media_type: str,
         media_id: str,
         source_url: str,
@@ -63,16 +61,14 @@ class Manifest:
     ) -> None:
         is_downloaded = status == DownloadStatus.DOWNLOADED
         downloaded_at = datetime.now(UTC).isoformat() if is_downloaded else None
-        values = (
-            page_id, media_type, media_id, source_url, local_filename, status.value, downloaded_at,
-        )
+        values = (media_type, media_id, source_url, local_filename, status.value, downloaded_at)
         self._connection.execute(
             """
             INSERT INTO downloads
-                (page_id, media_type, media_id, source_url, local_filename,
+                (media_type, media_id, source_url, local_filename,
                  download_status, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(page_id, media_type, media_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(media_type, media_id) DO UPDATE SET
                 source_url = excluded.source_url,
                 local_filename = excluded.local_filename,
                 download_status = excluded.download_status,

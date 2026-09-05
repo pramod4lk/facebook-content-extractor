@@ -5,7 +5,6 @@ from facebook_extractor.reels.scraper import (
     derive_media_id,
     extract_video_url,
     fetch_reel_video_url,
-    list_reels,
 )
 from facebook_extractor.shared.scraping import ScrapeError
 
@@ -64,69 +63,3 @@ class TestFetchReelVideoUrl:
 
         with pytest.raises(ScrapeError, match="login-required"):
             fetch_reel_video_url(make_client(handler), "https://m.facebook.com/reel/1/")
-
-
-class TestListReels:
-    def test_discovers_and_resolves_reels(self) -> None:
-        listing_html = '<a href="/reel/111/">a</a> <a href="/reel/222/">b</a>'
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/examplepage/videos":
-                return httpx.Response(200, text=listing_html)
-            video_url = f"https://x.com{request.url.path}.mp4"
-            return httpx.Response(200, text=f'<meta property="og:video" content="{video_url}">')
-
-        reels = list_reels(make_client(handler), "examplepage")
-
-        assert {r.id for r in reels} == {"111", "222"}
-
-    def test_respects_limit(self) -> None:
-        listing_html = '<a href="/reel/111/">a</a> <a href="/reel/222/">b</a>'
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/examplepage/videos":
-                return httpx.Response(200, text=listing_html)
-            return httpx.Response(200, text='<meta property="og:video" content="https://x.com/v.mp4">')
-
-        reels = list_reels(make_client(handler), "examplepage", limit=1)
-
-        assert len(reels) == 1
-
-    def test_deduplicates_repeated_links(self) -> None:
-        listing_html = '<a href="/reel/111/">a</a> <a href="/reel/111/">a again</a>'
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/examplepage/videos":
-                return httpx.Response(200, text=listing_html)
-            return httpx.Response(200, text='<meta property="og:video" content="https://x.com/111.mp4">')
-
-        reels = list_reels(make_client(handler), "examplepage")
-
-        assert len(reels) == 1
-
-    def test_item_resolution_failure_is_skipped_not_fatal(self) -> None:
-        listing_html = '<a href="/reel/111/">a</a> <a href="/reel/222/">b</a>'
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/examplepage/videos":
-                return httpx.Response(200, text=listing_html)
-            if request.url.path == "/reel/111/":
-                return httpx.Response(200, text="<html>nothing here</html>")
-            return httpx.Response(200, text='<meta property="og:video" content="https://x.com/222.mp4">')
-
-        reels = list_reels(make_client(handler), "examplepage")
-
-        assert [r.id for r in reels] == ["222"]
-
-    def test_initial_listing_failure_raises(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(404)
-
-        with pytest.raises(ScrapeError):
-            list_reels(make_client(handler), "examplepage")
-
-    def test_empty_listing_returns_empty_list(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, text="<html>no reels here</html>")
-
-        assert list_reels(make_client(handler), "examplepage") == []

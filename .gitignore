@@ -435,6 +435,9 @@ FodyWeavers.xsd
 
 downloads/
 
+# Local browser session (your Facebook login) — never commit this
+.browser_profile/
+
 *.db
 *.sqlite
 *.sqlite3
