@@ -1,173 +1,265 @@
 Facebook Page Photos & Reels Extractor
-Specification Version: 1.2 (condensed; same normative content as 1.1)
-Status: Implemented (v1) — see README.md for setup. Reels extraction is a confirmed
-Meta API limitation, not a bug (§7 API-005).
+Specification Version: 2.0 (supersedes 1.x's Meta Graph API approach entirely)
+Status: Implemented. Unofficial scraping tool — not affiliated with or endorsed by Meta.
 Target Runtime: Python 3.12+
 Application Type: Local CLI application
-Primary API: Meta Graph API
+Primary Mechanism: unofficial HTML scraping of Facebook's public mobile site — NOT the
+Meta Graph API. See §8 for why, and §19 for the risks this deliberately accepts.
 
 ## 1. Purpose
 
-A local Python CLI that reads a Facebook Page URL and Meta credentials from `.env`, retrieves the Page's available Photos and Reels via the Meta Graph API, and downloads them into an organized local directory. No web server, no Page URL as a CLI argument — everything sensitive comes from `.env`.
+A local Python CLI that, given any public Facebook Page URL, downloads that Page's Photos
+and Reels into an organized local directory — including Pages the user does not administer.
 
-Primary command: `python -m facebook_extractor`
+This is a deliberate pivot from v1.x, which used the official Meta Graph API. That approach
+was correct and safe, but structurally could not deliver "any public Page": Photos required
+a Page Access Token (only works for Pages you administer) or Meta's gated Pages Public
+Content Access grant (business verification + app review), and Reels have no read endpoint
+in the Graph API at all, for anyone, under any grant (confirmed against Meta's docs — see
+git history for the v1.x findings). Achieving "any given public Page" requires giving up the
+official API entirely. §19 documents exactly what that trade-off costs.
+
+No web server. Primary command: `python -m facebook_extractor`.
 
 ## 2. Workflow
 
-`.env` → Config Loader → Config Validation → URL Validation → Resolve Page → Retrieve Media (Photos ∥ Reels) → Duplicate Check → Downloader → Local Filesystem → Update Manifest → Extraction Summary
+`.env` → Config Loader → Config Validation → URL Validation → Scan Photos listing ∥ Scan
+Reels listing → per-item page fetch (resolve real media URL) → Duplicate Check → Downloader
+→ Local Filesystem → Update Download Manifest → Extraction Summary
 
 ## 3. Configuration (`.env`)
 
 ```
 FACEBOOK_PAGE_URL=https://www.facebook.com/examplepage   # required
-META_ACCESS_TOKEN=                                         # required
-META_GRAPH_API_VERSION=vXX.X                                # required
-OUTPUT_DIRECTORY=./downloads                                 # optional, default shown
-LOG_LEVEL=INFO                                               # optional, default shown
+OUTPUT_DIRECTORY=./downloads                                # optional, default shown
+LOG_LEVEL=INFO                                              # optional, default shown
 ```
 
-- CFG-001: Config MUST load from `.env` and be validated before any API request.
-- CFG-002: repo MUST include `.env.example` with the same keys and no real credentials.
-- CFG-003: `.gitignore` MUST exclude `.env`, `.env.*` (but not `.env.example`), `downloads/`, `*.db`/`*.sqlite*`, `__pycache__/`, `*.py[cod]`, `.pytest_cache/`, `.ruff_cache/`, `.venv/`/`venv/`.
-- CFG-004: secrets MUST NOT be hard-coded, logged, printed, committed, included in exception messages, or exposed via object `repr`/`str`.
+No credentials of any kind are collected, stored, or transmitted — there is nothing to
+protect, because nothing is authenticated. This is a direct simplification over v1.x
+(dropped `META_ACCESS_TOKEN`, `META_GRAPH_API_VERSION`).
+
+- CFG-001: config MUST load from `.env` and be validated before any request is made.
+- CFG-002: repo MUST include `.env.example` matching the keys above.
+- CFG-003: `.gitignore` MUST exclude `.env`, `.env.*` (not `.env.example`), `downloads/`, `*.db`/`*.sqlite*`, `__pycache__/`, `*.py[cod]`, `.pytest_cache/`, `.ruff_cache/`, `.venv/`/`venv/`.
 
 ## 4. Functional Requirements
 
-- **FR-001 Load Configuration** — load from `.env`; required: `FACEBOOK_PAGE_URL`, `META_ACCESS_TOKEN`, `META_GRAPH_API_VERSION`; optional: `OUTPUT_DIRECTORY`, `LOG_LEVEL`. Validate before any API call.
-- **FR-002 Facebook Page URL** — accept `facebook.com/<page>` with/without `www.`/trailing slash; normalize it; ignore query params that don't affect identity; invalid URLs MUST produce a clear config error.
-- **FR-003 Resolve Facebook Page** — resolve the URL to a Page identity via the API (never assume URL → Page ID). Must account for auth, permissions, API version, Page availability, and API limitations; if resolution isn't possible, report the limitation clearly.
-- **FR-004 Extract Photos** — retrieve Photos with metadata where permitted (`id`, `page_id`, `caption`, `width`, `height`, `created_at`, `permalink`, media URL, download URL). Fields may be absent — handle gracefully.
-- **FR-005 Extract Reels** — same as Photos, plus `duration`. If Meta doesn't expose downloadable Reel media for the configured credentials/API version, report that limitation clearly.
-- **FR-006 API Pagination** — follow pagination until no more results or `--limit` is reached (limit applies independently per media type, see CLI-004). Never assume one request returns everything.
-- **FR-007 Download Photos** → `<OUTPUT_DIRECTORY>/<page_name>/photos/<media_id>.<ext>`
-- **FR-008 Download Reels** → `<OUTPUT_DIRECTORY>/<page_name>/reels/<media_id>.<ext>`
-- **FR-009 Deterministic Filenames** — filename is `<facebook_media_id>.<extension>`; if a media ID can't be used, generate a deterministic safe fallback. Extension is derived in order: (1) response `Content-Type` header, (2) extension in the source/download URL, (3) default `.jpg` (Photos) / `.mp4` (Reels).
-- **FR-010 Safe Filenames** — sanitize all filenames; prevent path/directory traversal, invalid filesystem characters, unexpected directory creation, and excessively long names. Captions MUST NOT be used as filenames unsanitized.
-- **FR-011 Duplicate Detection** — primary key is the Facebook Media ID; already-downloaded media is SKIPPED by default.
-- **FR-012 Force Download** — `--force` allows re-downloading existing media.
-- **FR-013 Download Manifest** — MUST maintain a SQLite manifest (single local `.db` file) tracking at least `media_id`, `page_id`, `media_type`, `source_url`, `local_filename`, `download_status` (`pending`/`downloaded`/`failed`/`skipped`), `downloaded_at`. Used to determine whether media was already downloaded.
-- **FR-014 Resumable Extraction** — an interrupted run, re-run, SHOULD skip previously downloaded media and retry previously failed media (unless configured otherwise).
+- **FR-001 Load Configuration** — load `.env`; required: `FACEBOOK_PAGE_URL`; optional: `OUTPUT_DIRECTORY`, `LOG_LEVEL`. Validate before any request.
+- **FR-002 Facebook Page URL** — accept `facebook.com/<page>` with/without `www.`/trailing slash, `m.facebook.com`, and `profile.php?id=`; normalize; ignore irrelevant query params; invalid URLs MUST produce a clear config error.
+- **FR-003 Discover Photos** — crawl the Page's public photos listing (§8) and resolve each discovered item's direct image URL. No page-identity "resolution" step exists or is needed — the URL's slug/ID is used directly.
+- **FR-004 Discover Reels** — crawl the Page's public videos listing (§8) and resolve each discovered item's direct video URL.
+- **FR-005 Listing Pagination** — follow "more" pagination links in a listing page (§8) until none is found, a fetch fails, or `--limit` is reached (independently per media type, see CLI-004). A safety cap of 20 pages applies regardless (not a Facebook-documented limit — just a sane ceiling).
+- **FR-006 Per-Item Resolution Is Best-Effort** — a single item whose media URL can't be resolved (markup mismatch, transient fetch failure) is skipped with a warning, not fatal to the whole run. A failure fetching the *first* listing page for a media type IS fatal for that type (reported as a limitation) but never aborts the other media type.
+- **FR-007 Download Photos** → `<OUTPUT_DIRECTORY>/<page_slug>/photos/`
+- **FR-008 Download Reels** → `<OUTPUT_DIRECTORY>/<page_slug>/reels/`
+- **FR-009 Deterministic Filenames** — `<media_id>.<extension>`, where `media_id` is the `fbid` (Photos) or numeric path segment (Reels) extracted from the item's URL, falling back to a hash of the URL if none is found. Extension is derived in order: (1) response `Content-Type` header, (2) the source URL's own extension, (3) default `.jpg` (Photos) / `.mp4` (Reels).
+- **FR-010 Safe Filenames** — sanitize all filenames/path segments; prevent path traversal, invalid filesystem characters, unexpected directory creation, excessively long names.
+- **FR-011 Duplicate Detection** — primary key is the derived media ID, scoped per page slug + media type; already-downloaded media is SKIPPED by default.
+- **FR-012 Force Download** — `--force` re-downloads existing media.
+- **FR-013 Download Manifest** — SQLite manifest (single `.db` file) tracking `page_id` (the page slug), `media_type`, `media_id`, `source_url`, `local_filename`, `download_status` (`pending`/`downloaded`/`failed`/`skipped`), `downloaded_at`.
+- **FR-014 Resumable Extraction** — a re-run skips previously-downloaded media and retries previously-failed media, unless `--force` is set.
 
 ## 5. CLI Requirements
 
 | Flag | Behavior |
 |---|---|
-| `python -m facebook_extractor` (CLI-001) | Default: extract Photos + Reels; Page URL always from `.env`, never a CLI arg |
-| `--photos` (CLI-002) | Extract Photos only |
-| `--reels` (CLI-003) | Extract Reels only |
-| `--limit N` (CLI-004) | Cap applies **independently per media type** (`--limit 50` = up to 50 Photos AND up to 50 Reels, or just the one type if `--photos`/`--reels` is set); must not reset per pagination page |
+| `python -m facebook_extractor` (CLI-001) | Default: Photos + Reels; Page URL always from `.env` |
+| `--photos` (CLI-002) | Photos only |
+| `--reels` (CLI-003) | Reels only |
+| `--limit N` (CLI-004) | Cap applies independently per media type |
 | `--force` (CLI-005) | Re-download existing media |
-| `--verbose` (CLI-006) | Increase log detail |
+| `--verbose` (CLI-006) | Debug-level logging |
 
 ## 6. CLI Output
 
-Clear terminal output showing Page identity, per-type fetch/download progress, and a final summary (found/downloaded/skipped/failed per media type, output path). MUST NOT display access tokens or other secrets. See example in git history (v1.1) if a template is needed.
+Clear terminal output: Page slug, per-type scan/download progress, and a final summary
+(found/downloaded/skipped/failed per media type, output path). The banner and any
+limitation message MUST make clear this is not the official Meta API (see §19) — users
+should not mistake results for an authoritative, complete listing.
 
-## 7. Meta Graph API Requirements
+## 7. Data Models
 
-- **API-001** Use the official Graph API only — MUST NOT bypass auth, permissions, CAPTCHAs, rate limits, access controls, or other Meta restrictions.
-- **API-002** Graph API version MUST be configurable via `META_GRAPH_API_VERSION`, never hard-coded.
-- **API-003** Access token MUST come from `META_ACCESS_TOKEN`; never committed or logged.
-- **API-004** All API communication goes through one dedicated client (no raw HTTP calls scattered through the app). It SHOULD support: GET + query params, auth, pagination, timeouts, error handling, retries, rate-limit handling, logging, and **sequential execution only** (no concurrent requests in this version).
-- **API-005 API Feasibility** — before implementation, verify current Meta docs for: Page URL resolution, Photos/Reels retrieval, required permissions, token type, availability of download URLs, restrictions on public Pages, API version, recent deprecations. Do not guess API behavior.
+- **Photo**: `id`, `permalink`, `download_url` (optional — a discovered item with no resolvable URL is dropped, not modeled with a null field pretending richer metadata exists)
+- **Reel**: same shape as Photo.
 
-  **Confirmed findings (checked against current Meta for Developers docs, current API version v25.0):**
-  - `GET /{page-id}/photos` is supported and returns Photo nodes + pagination. It requires either (a) a Page Access Token for a Page the caller can `MODERATE`, plus `pages_read_engagement` + `pages_show_list`, or (b) the gated **Pages Public Content Access** feature (business verification + app review) with a System User token, for Pages the caller doesn't administer.
-  - `POST /{page-id}/video_reels` exists **for publishing new Reels only** — the docs explicitly state read/update/delete are unsupported on this edge. `GET /{page-id}/videos` is likewise unsupported for reading. **There is no Graph API endpoint to list or retrieve a Page's existing Reels/videos as of v25.0.** This is a platform limitation, not a permissions gap — FR-005's "clearly report the limitation" behavior is the correct (and only possible) implementation; do not attempt to work around it (e.g. via scraping).
-  - Default `META_GRAPH_API_VERSION` should be `v25.0` in `.env.example`, kept configurable per API-002.
+Deliberately smaller than a Graph-API-backed model would be (no caption, dimensions,
+timestamps, duration) — scraping a listing/permalink page does not reliably expose these,
+and modeling fields that are usually `None` in practice is worse than not having them.
 
-## 8. Architecture
+## 8. Scraping Requirements (replaces "Meta Graph API Requirements")
 
-**Vertical slice architecture**: code is grouped by feature (page resolution, photos, reels), not by technical layer. Each slice owns its service logic, models, and tests. A small `shared/` package holds only what's genuinely identical across slices — nothing extracted speculatively.
+This tool does not use the Meta Graph API. It fetches Facebook's own public pages with a
+plain HTTP GET — no login, no cookies/session, no JavaScript execution, no CAPTCHA-solving,
+no browser automation, no anti-bot evasion — and extracts data already embedded in those
+pages for any unauthenticated visitor (the same data a browser or a link-preview crawler
+would see).
+
+- **SCRAPE-001** All such requests go through `shared/scraping.py` (`fetch_html`), which also detects and clearly fails on a login-wall response rather than trying to push through it.
+- **SCRAPE-002** Listing pages are fetched from Facebook's lighter mobile interface (`m.facebook.com/<page_slug>/photos` and `/videos`) rather than the JS-heavy desktop site, since it's the closest thing to a scrapable server-rendered listing Facebook still serves.
+- **SCRAPE-003** Item permalinks are found via regex over the listing HTML (`photos/scraper.py`, `reels/scraper.py`); each permalink is then fetched individually to extract its actual media URL (`og:image` for Photos; `playable_url`/`og:video` patterns for Reels).
+- **SCRAPE-004** Pagination follows a "more" link found in the listing HTML (§4 FR-005); there is no documented cursor format to rely on, so this is inherently best-effort.
+- **SCRAPE-005** No retry-with-backoff is applied to scraping requests specifically (contrast with the Downloader's retry in §11): a failed scrape is usually a broken assumption about page structure or a block, not a transient blip, and retrying blocked/detection-sensitive requests is itself a step toward the anti-bot-evasion this tool explicitly avoids.
+- **SCRAPE-006** Every regex/pattern here is unversioned and will break silently whenever Facebook changes its markup — there is no upgrade path except updating the patterns after observing real breakage. Do not add complexity trying to make this "robust" against arbitrary future markup; keep patterns simple and let failures surface clearly (§19).
+
+## 9. Architecture
+
+**Vertical slice architecture**: code grouped by feature (photos, reels), not layer. Each
+slice owns its `models.py` + `scraper.py` + tests. `shared/` holds only what's genuinely
+identical across slices.
 
 ```
 facebook-media-extractor/
 ├── src/facebook_extractor/
 │   ├── __init__.py, __main__.py, cli.py, config.py
 │   ├── shared/
-│   │   ├── http_client.py   # Graph API client: auth, pagination, timeouts, retries, rate limits
+│   │   ├── scraping.py      # fetch_html (login-wall detection) + generic pagination-follow loop
 │   │   ├── url_parser.py    # Page URL validation/normalization
-│   │   ├── downloader.py    # streaming download + filename sanitization
+│   │   ├── downloader.py    # streaming download + filename sanitization/extension derivation
+│   │   ├── retry.py         # exponential backoff (used by downloader.py only, see SCRAPE-005)
 │   │   └── manifest.py      # SQLite download manifest
-│   ├── page_resolution/{service.py, models.py}
-│   ├── photos/{service.py, models.py}
-│   └── reels/{service.py, models.py}
-├── tests/  (mirrors the above: test_config.py, test_cli.py, shared/, page_resolution/, photos/, reels/)
+│   ├── photos/{models.py, scraper.py}
+│   └── reels/{models.py, scraper.py}
+├── tests/  (mirrors the above)
 ├── downloads/, .env.example, .gitignore, SPEC.md, README.md, pyproject.toml
 ```
 
-Structure MAY be adjusted for a clear reason, but MUST preserve vertical-slice grouping (feature-owned service+models; `shared/` only for genuinely cross-slice code). CLI orchestrates: config → URL parsing → page resolution → photos/reels services → downloader → manifest → summary. Business logic MUST NOT live in CLI argument handlers.
+No `page_resolution/` slice and no `shared/http_client.py` — there is no API to call and no
+Page-identity resolution step; the URL's slug is used directly. `cli.py` orchestrates:
+config → URL parsing → photos/reels scrapers → downloader → manifest → summary. Business
+logic MUST NOT live in CLI argument handlers.
 
-**Responsibilities** — Config: `.env`/env vars/validation/typed settings. HTTP Client: all Graph API I/O incl. auth/pagination/retry/rate-limit. URL Parser: validation/normalization/identifier extraction. Downloader: streaming, filename sanitization+extension, file writes, error handling. Manifest: SQLite tracking, duplicate detection, resume. Page/Photo/Reel slices: their own API calls + response normalization + models, via the shared HTTP client, with no cross-slice coupling.
+## 10. Security Requirements
 
-## 9. Data Models
+Sanitize filenames; prevent path traversal; use HTTPS; never execute downloaded files;
+apply sensible timeouts; don't trust external metadata blindly. No credentials exist to
+leak (§3) — this removes an entire category of v1.x's security surface.
 
-- **Page**: `id`, `name`, `username`, `url` (only fields the API actually returns)
-- **Media (generic)**: `id`, `page_id`, `media_type`, `source_url`, `download_url`, `filename`, `mime_type`, `created_at`, `downloaded_at`
-- **Photo** adds: `width`, `height`, `caption`, `permalink`
-- **Reel** adds: `duration`, `width`, `height`, `caption`, `permalink`
+## 11. Downloader & Retry
 
-All external API fields MUST be treated as optional.
+Unchanged from v1.x: stream large files, HTTPS, 30s default timeout, auto-create
+directories, safe atomic writes (temp file + rename), sequential (no concurrent
+downloads), and a failure downloading one item MUST NOT abort the run. Retry transient
+network failures / 5xx with exponential backoff (max 3 attempts, 1s/2s/4s, honoring
+`Retry-After`) — this is about ordinary network flakiness fetching an already-resolved
+media URL, distinct from SCRAPE-005's "don't retry a broken scrape" rule.
 
-## 10. Downloader & Retry
+## 12. Error Handling & Logging
 
-Downloader MUST: stream large files (never load full videos into memory), use HTTPS, apply a 30s default timeout, handle HTTP/network errors, auto-create directories, support duplicate detection, write files safely, report (not abort on) per-item failures, and run **sequentially** (no concurrent downloads in this version).
+Handle gracefully: missing/invalid `.env`, invalid Page URL, a blocked/login-walled
+listing or item fetch, network failures/timeouts, download failures, disk errors. Errors
+must be actionable, e.g. "`FACEBOOK_PAGE_URL` is missing from `.env`." Exit code `0` on
+full success; non-zero (e.g. `1`) on a config error or any failed/unavailable media type.
 
-Retry transient failures (network errors, 5xx, temporary rate limits) with exponential backoff: max 3 attempts, 1s/2s/4s delay, honoring a `Retry-After` header when present. Do NOT retry permanent failures (invalid credentials, missing permissions, invalid Page/media IDs) unless the error indicates a transient condition.
-
-## 11. Error Handling & Logging
-
-Handle gracefully: missing/invalid `.env` or config, invalid Page URL, Page resolution failure, invalid/expired token, missing permissions, Meta API errors, rate limiting, pagination failures, network failures/timeouts, missing/invalid media URLs, unsupported media, download failures, disk errors. Errors must be actionable (e.g. "`FACEBOOK_PAGE_URL` is missing from `.env`. Please configure a Facebook Page URL before running the extractor.") and never reveal secret values.
-
-Exit codes: `0` on full success; non-zero (e.g. `1`) on config error, Page-resolution failure, or any failed download.
-
-Logging: standard `logging` module, default `LOG_LEVEL=INFO`, `--verbose` increases detail. Log startup, config validation, Page resolution, API ops/pagination, media discovery, download progress, duplicate detection, retries, failures, and the completion summary. NEVER log `META_ACCESS_TOKEN` or any other credential.
-
-## 12. Security Requirements
-
-Keep secrets in `.env` (gitignored); validate external URLs; sanitize filenames; prevent path traversal; use HTTPS; avoid secret leakage; never execute downloaded files; apply sensible timeouts; avoid uncontrolled downloads; don't trust external metadata blindly.
+Logging: standard `logging`, default `LOG_LEVEL=INFO`, `--verbose` for debug detail. Log
+startup, config validation, scan progress, pagination, download progress, duplicate
+detection, retries, failures, completion summary.
 
 ## 13. Testing Requirements
 
-`pytest`; no test makes a real Meta API request — all external HTTP is mocked. Cover: config (loading, required/missing/invalid vars, secret protection); URL parser (valid/invalid URL, trailing slash, query params, normalization); HTTP client (success, API/auth errors, pagination, retries); page/photo/reel services (success, pagination, missing fields, empty response, not-found/API failure); downloader (image/video download, HTTP/network failure, duplicates, filename generation, safe path handling); manifest (insert/lookup/update, status, duplicate detection, resume); CLI (default run, `--photos`, `--reels`, `--limit`, `--force`, `--verbose`).
+`pytest`; no test makes a real request to facebook.com — all HTTP is mocked
+(`httpx.MockTransport`). Cover: config (loading/missing/invalid); URL parser
+(valid/invalid/trailing-slash/query-params/normalization); `shared/scraping`
+(success/non-200/login-wall/pagination-follow/safety-cap); Photos & Reels scrapers
+(discovery, per-item resolution, dedup, `--limit`, a single item's failure not being
+fatal, the first listing page's failure being fatal for that type); Downloader
+(image/video download, HTTP/network failure, filename generation, safe path handling);
+Manifest (insert/lookup/update, duplicate detection, resume); CLI (default, `--photos`,
+`--reels`, `--limit`, `--force`, `--verbose`).
 
 ## 14. Dependencies & Constraints
 
-Prefer: Python 3.12+, `httpx`, `pydantic`, `pydantic-settings`, `python-dotenv`, `pytest`, `ruff`. Additional deps only with clear benefit — avoid unnecessary ones. Use `pyproject.toml` with a standard build backend (hatchling or setuptools); entry point is `python -m facebook_extractor`, no console-script needed.
+Prefer: Python 3.12+, `httpx`, `pydantic`, `pydantic-settings`, `python-dotenv`, `pytest`,
+`ruff`. Unchanged from v1.x — the scraping approach needed no new dependency (`re`, `html`,
+`urllib.parse` from the standard library). `pyproject.toml` with a standard build backend
+(hatchling/setuptools); entry point `python -m facebook_extractor`.
 
-MUST NOT use a web framework (Flask/FastAPI/Django) — this is a local CLI, though internals should be separated enough that a future web API wouldn't require rewriting extraction logic (building that API is out of scope now). MUST NOT introduce Docker, Redis, Celery, RabbitMQ, Kubernetes, PostgreSQL, cloud storage, or message queues unless a real future requirement demands it — v1 stays a simple local app.
+MUST NOT use a web framework, Docker, or other infrastructure not already listed here
+without asking first — this stays a simple local CLI. MUST NOT add a headless
+browser/automation dependency (Playwright, Selenium, etc.) — that would cross from "read a
+public page" into the browser-automation/anti-bot-evasion territory §19 explicitly rules
+out; if the regex-based approach stops working, the fix is updating the regex, not adding
+a browser.
 
 ## 15. Output Structure & Scope
 
 ```
-downloads/<page_name>/
+downloads/<page_slug>/
+├── .manifest.db
 ├── photos/<media_id>.jpg ...
 └── reels/<media_id>.mp4 ...
 ```
-`<page_name>` MUST be sanitized before use as a directory name.
 
-**In scope**: `.env`-driven Page URL, Meta API config, Page resolution, Photos/Reels retrieval + pagination + metadata, downloading, duplicate detection, manifest, resume, CLI, logging, error handling, tests, docs.
-**Out of scope**: web UI, Flask/FastAPI/Django, auth UI, Meta OAuth web flow, cloud deployment/storage, distributed processing, scheduled jobs, automatic token renewal, scraping that bypasses Meta access controls.
+**In scope**: `.env`-driven Page URL (any public Page), scraping-based Photos/Reels
+discovery + pagination, downloading, duplicate detection, manifest, resume, CLI, logging,
+error handling, tests, docs.
+**Out of scope**: web UI, any web framework, cloud deployment/storage, distributed
+processing, scheduled jobs, logging in or holding a session, bypassing a login wall or
+CAPTCHA, browser automation, any other anti-bot/detection-evasion technique. Crossing any
+of these requires the same explicit, informed sign-off documented in §19 — not an
+assumption that "more scraping" is always fine because some scraping was already agreed to.
 
-**Important limitation**: the app MUST only download media legitimately exposed via the API to the authenticated app — a public Page's visibility does NOT guarantee its Photos/Reels are API-accessible. If Meta blocks access to a Page, media type, field, or download URL, report that limitation rather than circumventing it.
+## 16. Definition of Done
 
-## 16. Development Process
+`python -m facebook_extractor` loads/validates `.env`, discovers a given public Page's
+Photos and Reels via scraping, handles pagination, detects duplicates, downloads into the
+correct directories, maintains the manifest, resumes interrupted runs, reports failures
+per item/media-type without aborting the whole job, prints a final summary that's honest
+about not being the official API, passes tests and Ruff, and has complete setup/usage/risk
+documentation.
 
-1. **Repository Inspection** — inspect existing code/deps/tests/config; preserve useful existing work.
-2. **API Feasibility** — verify current Meta docs for Page URL resolution, Photos/Reels APIs, downloadable media URLs, permissions, token requirements, pagination, API version, and current limitations. No assumptions.
-3. **Architecture Proposal** — repository + API feasibility assessment, recommended architecture/directory structure/data models/endpoints/permissions/downloader+manifest design/testing strategy/risks/implementation plan.
-4. **Approval** — STOP after 1–3 and wait for explicit user approval before implementing substantial code. Do not silently proceed.
+## 17. Claude Code Instructions
 
-**Milestones** (after approval, adjustable if technically necessary): 1) project setup + config, 2) URL parser, 3) Meta API client, 4) Page resolution, 5) Photo extraction, 6) Reel extraction, 7) media downloader, 8) manifest + duplicate handling, 9) CLI + progress reporting, 10) testing + docs + cleanup.
+Treat this SPEC.md as the source of truth. Prefer simple solutions; avoid unnecessary
+abstractions. Never hard-code the Page URL. Never widen the scraping boundary in §19 (bulk
+scope is already granted; login/session/CAPTCHA-bypass/browser-automation is not) without
+the same explicit, informed sign-off from the project owner. When a scraping pattern breaks
+against real Facebook markup, the fix is a narrowly-scoped regex/pattern update with a
+test fixture capturing the new shape — not a rewrite toward heavier automation. Ask before
+major architectural changes. If a requirement is ambiguous, surface the ambiguity before
+making a major architectural decision.
 
-**Quality gate** after every milestone: run tests, run Ruff, verify imports, check error handling/secret handling/filesystem safety, fix issues found, summarize changes, name the next milestone. Don't proceed with known failing tests unless the failure is explicitly explained.
+## 18. Version History
 
-## 17. Definition of Done
+- **v1.x** used the official Meta Graph API. Correct and safe, but could not deliver "any
+  public Page": Photos needed a Page Access Token (Pages you administer) or Meta's gated
+  Pages Public Content Access (business verification + app review); Reels had no read
+  endpoint at all, for anyone. Superseded entirely by v2.0 at the project owner's explicit
+  request, accepting the trade-offs in §19.
+- **v2.0** (this version) drops the Graph API entirely in favor of unofficial scraping,
+  achieving "any given public Page" for both Photos and Reels, in exchange for the risks
+  in §19.
 
-`python -m facebook_extractor` loads and validates `.env`, authenticates, resolves the Page, retrieves Photos and Reels with pagination, normalizes metadata, detects duplicates, downloads into the correct directories, maintains the manifest, resumes interrupted runs, reports failures without aborting the whole job, prints a final summary, never leaks credentials, passes tests and Ruff, and has complete setup/usage docs.
+## 19. Risk Disclosure & Boundaries (read this before touching scraping code)
 
-## 18. Claude Code Instructions
+This is not a technicality — it's the central trade-off of this version of the project,
+made explicitly and knowingly by the project owner after the Graph API path was shown to
+structurally not support "any public Page."
 
-Treat this SPEC.md as the source of truth. Prefer simple solutions; avoid unnecessary abstractions or frameworks. Never hard-code secrets, the Page URL, or the API version. Never bypass Meta restrictions or silently change requirements. Ask before major architectural changes. If a requirement conflicts with actual Meta API behavior, prioritize the real API behavior and explain the limitation. If a requirement is ambiguous, surface the ambiguity before making a major architectural decision.
+**Accepted risks (not resolved by this spec — owned by the project owner):**
+- **Violates Facebook's Terms of Service.** Automated data collection outside the official
+  API is prohibited. Meta has pursued scraping operations before (cease-and-desist,
+  account bans, litigation).
+- **Fragile by construction.** Every pattern in `shared/scraping.py`, `photos/scraper.py`,
+  and `reels/scraper.py` is unversioned. Facebook can and does change its markup without
+  notice; this tool will break silently when that happens; there is no upgrade path except
+  observing the breakage and updating the pattern.
+- **No documented rate limit** applies (there's no API contract to read one from) — see
+  SCRAPE-005 for why failures are treated as "pattern broke," not retried as transient.
 
-**First action in this repo**: do NOT implement immediately. Inspect the repo → read this spec → check Meta API feasibility → identify exact endpoints/permissions needed → produce an architecture proposal + implementation plan + risks → STOP and wait for approval.
+**Hard boundaries that do NOT move without a fresh, explicit conversation with the project
+owner** (bulk scraping itself was already explicitly approved; these are the next line):
+- No login, no session, no cookies, no stored credentials of any kind.
+- No CAPTCHA-solving.
+- No browser automation (Playwright/Selenium/headless Chrome) or JS execution.
+- No techniques whose purpose is evading detection/blocking (rotating user agents to look
+  like different real users, proxy rotation to dodge IP blocks, mimicking real browser
+  request timing, etc.). A plain, honestly-labeled `User-Agent` and a straightforward GET
+  is the ceiling.
+- No enumeration beyond what a page's own listing exposes (no guessing IDs, no hitting
+  internal/undocumented GraphQL endpoints reverse-engineered from the app).
+
+If achieving a future requirement would require crossing one of these, the correct action
+is to stop and ask — the same way the Graph API's limitations were surfaced before this
+pivot happened, not to silently escalate technique because a boundary was crossed once
+before.

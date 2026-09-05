@@ -9,17 +9,16 @@ from typing import Any, Literal
 import httpx
 
 from facebook_extractor.config import ConfigurationError, Settings, load_settings
-from facebook_extractor.page_resolution.service import PageResolutionError, resolve_page
-from facebook_extractor.photos.service import PhotoExtractionError, fetch_photos
-from facebook_extractor.reels.service import ReelExtractionError, fetch_reels
+from facebook_extractor.photos.scraper import list_photos
+from facebook_extractor.reels.scraper import list_reels
 from facebook_extractor.shared.downloader import (
     DownloadError,
     download_media,
     sanitize_path_component,
 )
-from facebook_extractor.shared.http_client import GraphAPIClient
 from facebook_extractor.shared.logging_setup import configure_logging
 from facebook_extractor.shared.manifest import DownloadStatus, Manifest, should_skip
+from facebook_extractor.shared.scraping import ScrapeError
 from facebook_extractor.shared.url_parser import InvalidFacebookUrlError, parse_page_url
 
 logger = logging.getLogger(__name__)
@@ -37,7 +36,9 @@ class MediaTypeSummary:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="facebook_extractor",
-        description="Extract a Facebook Page's Photos and Reels via the Meta Graph API.",
+        description=(
+            "Extract a public Facebook Page's Photos and Reels (unofficial — see SPEC.md §19)."
+        ),
     )
     media_group = parser.add_mutually_exclusive_group()
     media_group.add_argument("--photos", action="store_true", help="Extract Photos only")
@@ -84,60 +85,42 @@ def run_extraction(
     limit: int | None,
     force: bool,
 ) -> int:
-    print("Facebook Media Extractor")
-    print("========================\n")
+    print("Facebook Media Extractor (unofficial — not the Meta Graph API; see SPEC.md §19)")
+    print("=================================================================================\n")
+    print(f"Page: {page_slug}\n")
 
-    graph_client = GraphAPIClient(
-        access_token=settings.meta_access_token.get_secret_value(),
-        api_version=settings.meta_graph_api_version,
-    )
-    download_client = httpx.Client()
+    client = httpx.Client()
     summaries: dict[str, MediaTypeSummary] = {}
+    page_dir_name = sanitize_path_component(page_slug, fallback="page")
+    output_root = Path(settings.output_directory) / page_dir_name
+    manifest = Manifest(output_root / ".manifest.db")
 
     try:
-        try:
-            page = resolve_page(graph_client, page_slug)
-        except PageResolutionError as exc:
-            print(f"Page resolution failed:\n\n{exc}", file=sys.stderr)
-            return 1
-
-        print(f"Page: {page.name}")
-        print(f"URL: {settings.facebook_page_url}\n")
-
-        page_dir_name = sanitize_path_component(page.name, fallback=page.id)
-        output_root = Path(settings.output_directory) / page_dir_name
-        manifest = Manifest(output_root / ".manifest.db")
-
-        try:
-            if do_photos:
-                summaries["Photos"] = _fetch_and_process(
-                    label="Photos",
-                    media_kind="photo",
-                    fetch=lambda: fetch_photos(graph_client, page.id, limit=limit),
-                    extraction_error=PhotoExtractionError,
-                    page_id=page.id,
-                    output_dir=output_root / "photos",
-                    manifest=manifest,
-                    force=force,
-                    download_client=download_client,
-                )
-            if do_reels:
-                summaries["Reels"] = _fetch_and_process(
-                    label="Reels",
-                    media_kind="reel",
-                    fetch=lambda: fetch_reels(graph_client, page.id, limit=limit),
-                    extraction_error=ReelExtractionError,
-                    page_id=page.id,
-                    output_dir=output_root / "reels",
-                    manifest=manifest,
-                    force=force,
-                    download_client=download_client,
-                )
-        finally:
-            manifest.close()
+        if do_photos:
+            summaries["Photos"] = _scrape_and_process(
+                label="Photos",
+                media_kind="photo",
+                list_items=lambda: list_photos(client, page_slug, limit=limit),
+                page_id=page_slug,
+                output_dir=output_root / "photos",
+                manifest=manifest,
+                force=force,
+                download_client=client,
+            )
+        if do_reels:
+            summaries["Reels"] = _scrape_and_process(
+                label="Reels",
+                media_kind="reel",
+                list_items=lambda: list_reels(client, page_slug, limit=limit),
+                page_id=page_slug,
+                output_dir=output_root / "reels",
+                manifest=manifest,
+                force=force,
+                download_client=client,
+            )
     finally:
-        graph_client.close()
-        download_client.close()
+        manifest.close()
+        client.close()
 
     _print_summary(summaries, output_root)
 
@@ -145,22 +128,21 @@ def run_extraction(
     return 1 if has_problems else 0
 
 
-def _fetch_and_process(
+def _scrape_and_process(
     *,
     label: str,
     media_kind: Literal["photo", "reel"],
-    fetch: Callable[[], list[Any]],
-    extraction_error: type[Exception],
+    list_items: Callable[[], list[Any]],
     page_id: str,
     output_dir: Path,
     manifest: Manifest,
     force: bool,
     download_client: httpx.Client,
 ) -> MediaTypeSummary:
-    print(f"Fetching {label.lower()}...")
+    print(f"Scanning for {label.lower()}...")
     try:
-        items = fetch()
-    except extraction_error as exc:
+        items = list_items()
+    except ScrapeError as exc:
         print(f"Not available: {exc}\n")
         return MediaTypeSummary(limitation=str(exc))
 

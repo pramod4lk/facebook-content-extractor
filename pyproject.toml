@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "facebook-extractor"
 version = "0.1.0"
-description = "Local CLI that extracts a Facebook Page's Photos and Reels via the Meta Graph API"
+description = "Local CLI that downloads a public Facebook Page's Photos and Reels (unofficial scraper)"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
